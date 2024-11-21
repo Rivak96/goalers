@@ -9,12 +9,19 @@
           </div>
           
           <div class="flex items-center space-x-4">
-            <button
-              @click="showCheckInModal = true"
-              class="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700"
-            >
-              Daily Check-in
-            </button>
+            <!-- Update the check-in button in your template -->
+<button
+  @click="showCheckInModal = true"
+  :disabled="!canCheckInToday(userData.lastCheckIn)"
+  class="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+>
+  <span v-if="!canCheckInToday(userData.lastCheckIn)">
+    Next check-in available tomorrow
+  </span>
+  <span v-else>
+    Daily Check-in
+  </span>
+</button>
             <button
               @click="showUserProfile = true"
               class="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md text-gray-500 bg-white hover:text-gray-700 focus:outline-none"
@@ -50,6 +57,9 @@
                 <p class="mt-1 text-2xl font-semibold text-gray-900">
                   {{ Math.round(currentCalories) }}
                 </p>
+                <div v-if="lastAdjustmentInfo" class="mt-2 text-xs text-gray-500">
+  {{ lastAdjustmentInfo }}
+</div>
               </div>
               <div 
                 v-if="calorieAdjustment"
@@ -670,7 +680,8 @@ import {
   orderBy,
   limit,
   getDocs,
-  serverTimestamp 
+  serverTimestamp,
+  writeBatch
 } from 'firebase/firestore'
 
 // Register ChartJS components
@@ -748,13 +759,12 @@ const WEEKLY_TARGETS = {
 
 // Helper Functions
 const calculateWeeklyChange = (progress) => {
-  if (progress.length < 2) return 0
+  if (!progress || progress.length < 2) return 0
   const latestWeight = progress[0].weight
   const previousWeight = progress[progress.length - 1].weight
   const weeksPassed = Math.min(7, progress.length - 1)
-  return ((latestWeight - previousWeight) / weeksPassed).toFixed(2)
+  return parseFloat(((latestWeight - previousWeight) / weeksPassed).toFixed(2))
 }
-
 const determineAdjustment = (weeklyChange, goal, adherence) => {
   const targets = WEEKLY_TARGETS[goal]
   if (!targets) return 0
@@ -1012,77 +1022,40 @@ const fetchUserData = async () => {
       return
     }
 
-    const userDoc = await getDoc(doc(db, 'users', userId))
+    const userRef = doc(db, 'users', userId)
+    const userDoc = await getDoc(userRef)
     
     if (userDoc.exists()) {
       const data = userDoc.data()
-      console.log('Raw user data from Firebase:', data) // Debug log
-
-      // Ensure all required fields have values
-      const userDataWithDefaults = {
-        weight: data.weight || 0,
-        height: data.height || 0,
-        age: data.age || 0,
-        gender: data.gender || 'male',
-        activityLevel: data.activityLevel || '1.2',
-        goal: data.goal || 'maintain',
-        targetWeight: data.targetWeight || data.weight,
-        startWeight: data.startWeight || data.weight,
-        dailyCalories: data.dailyCalories || 0,
-        lastCheckIn: data.lastCheckIn || null,
-        progress: []
-      }
-      if (!userData.value.height || !userData.value.age) {
-      showProfileSetup.value = true
-    }
-      // Calculate base calories if not set or if required fields changed
-      if (!userDataWithDefaults.dailyCalories && 
-          userDataWithDefaults.weight && 
-          userDataWithDefaults.height && 
-          userDataWithDefaults.age && 
-          userDataWithDefaults.gender) {
-        
-        const baseCalories = calculateBaseline(userDataWithDefaults)
-        console.log('Calculated base calories:', baseCalories) // Debug log
-        
-        if (baseCalories > 0) {
-          userDataWithDefaults.dailyCalories = baseCalories
-          // Update Firebase with calculated calories
-          await updateDoc(doc(db, 'users', userId), {
-            dailyCalories: baseCalories
-          })
-        }
-      }
 
       // Get progress history
-      const progressRef = collection(db, 'users', userId, 'progress')
+      const progressRef = collection(userRef, 'progress')
       const q = query(
         progressRef,
         orderBy('timestamp', 'desc'),
         limit(parseInt(chartTimeframe.value))
       )
       const progressSnap = await getDocs(q)
-      userDataWithDefaults.progress = progressSnap.docs.map(doc => ({
+      const progress = progressSnap.docs.map(doc => ({
         id: doc.id,
         ...doc.data()
       }))
 
-      // Update local state
-      userData.value = userDataWithDefaults
-      console.log('Updated userData:', userData.value) // Debug log
+      userData.value = {
+        ...data,
+        progress
+      }
 
-      // If we still don't have calories, try calculating again
+      // Calculate calories if needed
       if (!userData.value.dailyCalories) {
-        const recalculatedCalories = calculateBaseline(userData.value)
-        if (recalculatedCalories > 0) {
-          userData.value.dailyCalories = recalculatedCalories
-          await updateDoc(doc(db, 'users', userId), {
-            dailyCalories: recalculatedCalories
+        const baseCalories = calculateBaseline(userData.value)
+        if (baseCalories > 0) {
+          await updateDoc(userRef, {
+            dailyCalories: baseCalories
           })
+          userData.value.dailyCalories = baseCalories
         }
       }
-    } else {
-      console.error('No user document found')
     }
   } catch (err) {
     error.value = 'Error loading user data: ' + err.message
@@ -1095,7 +1068,21 @@ const fetchUserData = async () => {
 const handleCheckIn = async () => {
   try {
     loading.value = true
-    const userId = auth.currentUser.uid
+    const userId = auth.currentUser?.uid
+    
+    if (!userId) {
+      throw new Error('No authenticated user')
+    }
+
+    // Check if user already checked in today
+    if (!canCheckInToday(userData.value.lastCheckIn)) {
+      throw new Error('You have already checked in today. Next check-in available tomorrow.')
+    }
+
+    const userRef = doc(db, 'users', userId)
+    const progressRef = collection(userRef, 'progress')
+    const calorieHistoryRef = collection(userRef, 'calorieHistory')
+
     const newWeight = parseFloat(checkInData.value.weight)
     
     // Calculate calorie adjustment
@@ -1104,11 +1091,15 @@ const handleCheckIn = async () => {
       ...userData.value.progress
     ])
     
-    const adjustment = determineAdjustment(
-      weightChange,
-      userData.value.goal,
-      checkInData.value.adherence
-    )
+    // Only calculate adjustment if a week has passed since last adjustment
+    let adjustment = 0
+    if (canAdjustCalories(userData.value.progress)) {
+      adjustment = determineAdjustment(
+        weightChange,
+        userData.value.goal,
+        checkInData.value.adherence
+      )
+    }
 
     const newCalories = userData.value.dailyCalories + adjustment
 
@@ -1124,26 +1115,43 @@ const handleCheckIn = async () => {
       timestamp: serverTimestamp()
     }
 
-    // Add to progress collection
-    await addDoc(collection(db, 'users', userId, 'progress'), progressData)
+    // Create batch to ensure atomic updates
+    const batch = writeBatch(db)
 
-    // Update user document
-    await updateDoc(doc(db, 'users', userId), {
+    // Add progress entry
+    const newProgressRef = doc(progressRef)
+    batch.set(newProgressRef, progressData)
+
+    // Prepare user document update
+    const userUpdate = {
       weight: newWeight,
       dailyCalories: newCalories,
-      lastCheckIn: new Date().toISOString()
-    })
+      lastCheckIn: serverTimestamp(),
+    }
 
-    // Create adjustment history entry if calories changed
+    // Only add lastCalorieAdjustment if there was an adjustment
     if (adjustment !== 0) {
-      await addDoc(collection(db, 'users', userId, 'calorieHistory'), {
+      userUpdate.lastCalorieAdjustment = serverTimestamp()
+    }
+
+    // Update user document
+    batch.update(userRef, userUpdate)
+
+    // Add calorie history entry if there was an adjustment
+    if (adjustment !== 0) {
+      const historyEntry = {
         previousCalories: userData.value.dailyCalories,
         newCalories,
         change: adjustment,
         reason: generateAdjustmentReason(weightChange, userData.value.goal),
         timestamp: serverTimestamp()
-      })
+      }
+      const newHistoryRef = doc(calorieHistoryRef)
+      batch.set(newHistoryRef, historyEntry)
     }
+
+    // Commit all changes
+    await batch.commit()
 
     // Refresh data
     await fetchUserData()
@@ -1157,6 +1165,9 @@ const handleCheckIn = async () => {
       hunger: 5,
       notes: ''
     }
+
+    // Show success message
+    showSuccessMessage('Check-in saved successfully')
   } catch (err) {
     error.value = 'Error saving check-in: ' + err.message
     console.error('Error handling check-in:', err)
@@ -1165,6 +1176,44 @@ const handleCheckIn = async () => {
   }
 }
 
+// Add this helper function for success messages
+const showSuccessMessage = (message) => {
+  // You can implement this based on your UI needs
+  // For example, using a toast notification
+  console.log('Success:', message)
+}
+// Add these utility functions
+const canCheckInToday = (lastCheckIn) => {
+  if (!lastCheckIn) return true
+  
+  const lastDate = new Date(lastCheckIn.seconds * 1000)
+  const today = new Date()
+  
+  return !isSameDay(lastDate, today)
+}
+
+const canAdjustCalories = (progress) => {
+  if (!progress || !Array.isArray(progress) || progress.length === 0) return true
+  
+  const lastAdjustment = progress.find(p => p?.adjustment !== 0)
+  if (!lastAdjustment || !lastAdjustment.timestamp) return true
+  
+  const lastAdjustmentDate = new Date(lastAdjustment.timestamp.seconds * 1000)
+  const today = new Date()
+  
+  return daysBetween(lastAdjustmentDate, today) >= 7
+}
+
+const isSameDay = (date1, date2) => {
+  return date1.getFullYear() === date2.getFullYear() &&
+         date1.getMonth() === date2.getMonth() &&
+         date1.getDate() === date2.getDate()
+}
+
+const daysBetween = (date1, date2) => {
+  const oneDay = 24 * 60 * 60 * 1000 // hours * minutes * seconds * milliseconds
+  return Math.round(Math.abs((date1 - date2) / oneDay))
+}
 // Analysis and Insights
 const generateAdjustmentReason = (weightChange, goal) => {
   const targets = WEEKLY_TARGETS[goal]
@@ -1590,6 +1639,19 @@ const handleProfileUpdate = async () => {
     loading.value = false
   }
 }
+
+const lastAdjustmentInfo = computed(() => {
+  const lastAdjustment = userData.value.progress.find(p => p.adjustment !== 0)
+  if (!lastAdjustment) return 'No previous adjustments'
+  
+  const lastDate = new Date(lastAdjustment.timestamp.seconds * 1000)
+  const daysUntilNext = 7 - daysBetween(lastDate, new Date())
+  
+  if (daysUntilNext > 0) {
+    return `Next calorie adjustment available in ${daysUntilNext} days`
+  }
+  return 'Calorie adjustment available'
+})
 // Initialize dashboard
 onMounted(() => {
   fetchUserData()
